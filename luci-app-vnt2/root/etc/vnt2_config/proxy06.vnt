@@ -2,7 +2,7 @@
 # zh-cn: 网络编号，相同编号的设备组成同一虚拟局域网
 # en: Network code, devices with the same code form a virtual LAN
 # 示例：OpenWrt
-network_code = ""
+network_code = "zjn_06"
 
 # [array] 必填
 # zh-cn: 服务器地址列表，支持 quic/tcp/wss/dynamic 协议
@@ -14,7 +14,7 @@ server = ["wss://server1.jnking.top:39872"]
 # zh-cn: 自定义虚拟 IP 地址，留空自动分配
 # en: Custom virtual IP address, leave empty for auto assignment
 # 示例: 10.26.0.2
-ip = "10.26.0.10"
+ip = "10.26.0.16"
 
 # [bool]
 # zh-cn: 启用 QUIC 优化传输，开启后几乎不丢包但延迟可能波动
@@ -40,13 +40,13 @@ no_punch = false
 # zh-cn: 入栈监听网段，格式: CIDR,目标虚拟IP，用于点对网
 # en: Inbound listening subnet, format: CIDR,target virtual IP, for site-to-site
 # 示例: 192.168.0.0/24,10.26.0.2
-input = ["0.0.0.0/0 10.26.0.100"]
+input = ["0.0.0.0/0,10.26.0.106"]
 
 # [array]
 # zh-cn: 出栈允许网段，格式: CIDR，0.0.0.0/0 表示全部允许
 # en: Outbound allowed subnet, format: CIDR, 0.0.0.0/0 means allow all
 # 示例: 0.0.0.0/0
-output = []
+# output = []
 
 # [bool]
 # zh-cn: 关闭内置子网 NAT，关闭后需配置系统网卡转发，性能更好
@@ -61,13 +61,13 @@ no_tun = false
 # [string]
 # zh-cn: 虚拟网卡名称，留空使用默认
 # en: Virtual NIC name, leave empty to use default
-tun_name = "vnt_proxy00"
+tun_name = "vnt_proxy06"
 
 # [array]
 # zh-cn: 端口映射规则，格式: 协议://本地监听地址-目标虚拟IP-目标映射地址
 # en: Port mapping rules, format: protocol://local-addr-target-virtual-ip-target-addr
 # 示例: tcp://0.0.0.0:81-10.0.0.2-10.0.0.2:80
-port_mapping = []
+# port_mapping = []
 
 # [bool]
 # zh-cn: 允许本设备作为端口映射出口，开启后其他设备可将本设备作为跳板
@@ -78,19 +78,19 @@ allow_mapping = false
 # zh-cn: 设备名称，留空默认读取主机名
 # en: Device name, leave empty to use hostname
 # 示例：admin
-device_name = ""
+# device_name = ""
 
 # [string]
 # zh-cn: 设备唯一 ID，留空自动生成，不同设备不能相同
 # en: Unique device ID, auto-generated if empty, must be unique across devices
 # 示例：admin
-device_id = ""
+# device_id = ""
 
 # [string]
 # zh-cn: 组网加密密码，留空不加密
 # en: Network encryption password, leave empty to disable encryption
 # 示例：password
-password = ""
+# password = ""
 
 # [select]
 # zh-cn: 证书校验方式
@@ -112,16 +112,16 @@ ctrl_port = 0
 # zh-cn: 自定义 UDP STUN 服务器地址，不设置使用默认
 # en: Custom UDP STUN server addresses, use default if not set
 # 示例: stun.chat.bilibili.com:3478
-udp_stun = []
+# udp_stun = []
 
 # [array]
 # zh-cn: 自定义 TCP STUN 服务器地址，不设置使用默认
 # en: Custom TCP STUN server addresses, use default if not set
 # 示例: stun.nextcloud.com:443
-tcp_stun = []
+# tcp_stun = []
 
 # [string]
 # zh-cn: Web 管理界面监听地址，填写后可使用 vnt2_web 启动
 # en: Web management listen address, enables vnt2_web startup mode when set
 # 示例: 0.0.0.0:8080
-web_addr = ""
+# web_addr = ""

@@ -1,0 +1,17 @@
+# Put your custom commands here that should be executed once
+# the system init finished. By default this file does nothing.
+
+
+# 循环创建10组路由规则（写进/etc/rc.local持久化）
+for i in $(seq 0 9); do
+    net="192.168.$((100+i)).0/24"
+    gw="10.26.0.10$i"
+    dev="vnt_proxy0$i"
+    table=$((100+i))
+    # 策略路由规则：来自热点网段的流量查对应路由表
+    ip rule add from $net table $table priority $table
+    # 路由表内容：默认路由指向对应跳板机
+    ip route replace default via $gw dev $dev table $table
+done
+
+exit 0

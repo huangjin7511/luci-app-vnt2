@@ -1,0 +1,88 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+USE_PROCD=1
+
+NAME=vnt-hotspot-manager
+PROG=/etc/vnt/vnt-hotspot-manager
+PID_FILE=/var/run/vnt-hotspot-manager.pid
+LOG_FILE=/var/log/vnt-hotspot.log
+
+start_service() {
+    echo "启动 VNT 热点管理器..."
+    # 检查主程序是否存在
+    [ -f "$PROG" ] || {
+        echo "错误：$PROG 不存在，请先部署主程序"
+        exit 1
+    }
+    chmod +x "$PROG"
+
+    # 创建日志目录
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    chmod 644 "$LOG_FILE"
+
+    # Procd 托管配置（前台运行，自动重启）
+    procd_open_instance "$NAME"
+    procd_set_param command "$PROG"
+    procd_set_param pidfile "$PID_FILE"
+    procd_set_param stdout 1   # 日志重定向到系统日志
+    procd_set_param stderr 1
+    procd_set_param respawn    # 崩溃自动重启
+    procd_close_instance
+}
+
+stop_service() {
+    echo "停止 VNT 热点管理器..."
+    # 终止主进程
+    if [ -f "$PID_FILE" ]; then
+        local pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid"
+            # 等待进程优雅退出
+            for i in $(seq 1 5); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 1
+            done
+        fi
+        rm -f "$PID_FILE"
+    fi
+
+    # 兜底隐藏所有热点（防止主进程异常退出未清理）
+    echo "兜底隐藏所有 proxy 热点..."
+    . /lib/functions.sh
+    config_load wireless
+    config_foreach() {
+        local section="$1"
+        local ssid ifname
+        config_get ssid "$section" ssid
+        # 匹配所有 proxyXX 热点
+        case "$ssid" in
+            proxy*)
+                config_get ifname "$section" ifname
+                if [ -n "$ifname" ]; then
+                    hostapd_cli -i "$ifname" set ignore_broadcast_ssid 1 >/dev/null 2>&1
+                    hostapd_cli -i "$ifname" disable >/dev/null 2>&1
+                    sleep 0.2
+                    hostapd_cli -i "$ifname" enable >/dev/null 2>&1
+                fi
+                uci set wireless.$section.hidden=1
+                ;;
+        esac
+    }
+    config_foreach wifi-iface
+    uci commit wireless
+    echo "兜底清理完成"
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}
+
+reload() {
+    # 不支持热重载，直接重启
+    restart
+}

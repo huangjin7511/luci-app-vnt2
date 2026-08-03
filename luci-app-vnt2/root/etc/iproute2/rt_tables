@@ -1,0 +1,44 @@
+#
+# reserved values
+#
+128	prelocal
+255	local
+254	main
+253	default
+0	unspec
+#
+# local
+#
+#1	inr.ruhep
+
+200 vnt00
+201 vnt01
+202 vnt02
+203 vnt03
+204 vnt04
+205 vnt05
+206 vnt06
+207 vnt07
+208 vnt08
+209 vnt09
+100 proxy100
+101 proxy101
+102 proxy102
+103 proxy103
+104 proxy104
+105 proxy105
+106 proxy106
+107 proxy107
+108 proxy108
+109 proxy109
+256 pbr_wan
+257 pbr_vnt2_proxy00
+258 pbr_vnt2_proxy01
+259 pbr_vnt2_proxy02
+260 pbr_vnt2_proxy03
+261 pbr_vnt2_proxy04
+262 pbr_vnt2_proxy05
+263 pbr_vnt2_proxy06
+264 pbr_vnt2_proxy07
+265 pbr_vnt2_proxy08
+266 pbr_vnt2_proxy09
