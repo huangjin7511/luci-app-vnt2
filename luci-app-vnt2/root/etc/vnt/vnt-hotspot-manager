@@ -1,7 +1,8 @@
 #!/bin/sh
 # /etc/vnt/vnt-hotspot-manager
 # KWRT VNT 隧道监控 + Hostapd-CLI 热点隐藏控制器
-# 最终稳定版：仅使用 set ignore_broadcast_ssid，彻底杜绝桥口震荡
+# 动态根据 UCI 中存在的 proxy00~proxy0n 热点 SSID 生成映射
+# 集成策略路由、NAT、转发规则
 
 PROG=/etc/vnt/vnt-hotspot-manager
 PID_FILE=/var/run/vnt-hotspot-manager.pid
@@ -14,29 +15,32 @@ CHECK_INTERVAL=10
 PING_COUNT=3
 PING_TIMEOUT=2
 
-# 热点-VNT映射表
-MAPPING="proxy00 vnt_proxy00 10.26.0.100
-proxy01 vnt_proxy01 10.26.0.101
-proxy02 vnt_proxy02 10.26.0.102
-proxy03 vnt_proxy03 10.26.0.103
-proxy04 vnt_proxy04 10.26.0.104
-proxy05 vnt_proxy05 10.26.0.105
-proxy06 vnt_proxy06 10.26.0.106
-proxy07 vnt_proxy07 10.26.0.107
-proxy08 vnt_proxy08 10.26.0.108
-proxy09 vnt_proxy09 10.26.0.109"
+# ---------- 动态构建映射表 ----------
+build_mapping() {
+    uci show wireless | grep "=wifi-iface" | while IFS='=' read -r section _; do
+        cur_ssid=$(uci -q get "${section}.ssid" 2>/dev/null)
+        case "$cur_ssid" in
+            proxy[0-9][0-9])
+                idx="${cur_ssid#proxy}"
+                num=$((10#$idx))
+                vnt_dev="vnt_proxy${idx}"
+                peer_ip="10.26.0.$((100+num))"
+                echo "${cur_ssid} ${vnt_dev} ${peer_ip}"
+                ;;
+        esac
+    done | sort -k1
+}
 
 log_message() {
-    local level="$1"
-    local msg="$2"
+    level="$1"
+    msg="$2"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $msg" >> "$LOG_FILE"
 }
 
-# 获取无线配置节名 (如 wifinet2)
 get_wifi_section() {
-    local ssid="$1"
+    ssid="$1"
     uci show wireless | grep "=wifi-iface" | while IFS='=' read -r section _; do
-        local cur_ssid=$(uci -q get "${section}.ssid")
+        cur_ssid=$(uci -q get "${section}.ssid")
         if [ "$cur_ssid" = "$ssid" ]; then
             echo "${section#wireless.}"
             break
@@ -44,17 +48,16 @@ get_wifi_section() {
     done
 }
 
-# 通过 hostapd 运行时状态获取 BSS（最准确）
 get_bss_by_ssid() {
-    local target_ssid="$1"
-    local hostapd_dir="/var/run/hostapd"
+    target_ssid="$1"
+    hostapd_dir="/var/run/hostapd"
     [ -d "$hostapd_dir" ] || hostapd_dir=$(find /var/run -name "hostapd*" -type d | head -1)
     [ -z "$hostapd_dir" ] || [ ! -d "$hostapd_dir" ] && return
 
     for bss_socket in "$hostapd_dir"/*; do
         [ -S "$bss_socket" ] || continue
-        local bss_name=$(basename "$bss_socket")
-        local current_ssid=$(hostapd_cli -s "$hostapd_dir" -i "$bss_name" get_config 2>/dev/null | grep "^ssid=" | cut -d'=' -f2)
+        bss_name=$(basename "$bss_socket")
+        current_ssid=$(hostapd_cli -s "$hostapd_dir" -i "$bss_name" get_config 2>/dev/null | grep "^ssid=" | cut -d'=' -f2)
         if [ "$current_ssid" = "$target_ssid" ]; then
             echo "$bss_name"
             return
@@ -62,51 +65,101 @@ get_bss_by_ssid() {
     done
 }
 
-# 检查 VNT 连通性
 check_vnt_connectivity() {
-    local vnt_dev="$1"
-    local peer_ip="$2"
+    vnt_dev="$1"
+    peer_ip="$2"
     ip link show "$vnt_dev" 2>/dev/null | grep -q "LOWER_UP" || return 1
     ping -I "$vnt_dev" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$peer_ip" >/dev/null 2>&1
 }
 
-# ==================== 核心修正：移除 disable/enable ====================
-# 仅设置 ignore_broadcast_ssid，不触发桥口震荡
 set_hotspot_hidden() {
-    local ssid="$1"
-    local target_hidden="$2" # 1=隐藏 0=显示
-
-    local bss=$(get_bss_by_ssid "$ssid")
-    local section=$(get_wifi_section "$ssid")
-
+    ssid="$1"
+    target_hidden="$2"
+    bss=$(get_bss_by_ssid "$ssid")
+    section=$(get_wifi_section "$ssid")
     if [ -z "$bss" ] || [ -z "$section" ]; then
         return 1
     fi
-
-    # 检查 UCI 基线
-    local current_hidden=$(uci -q get wireless.$section.hidden || echo "0")
+    current_hidden=$(uci -q get wireless.$section.hidden || echo "0")
     if [ "$current_hidden" = "$target_hidden" ]; then
-        return 1 # 状态一致，无需操作
+        return 1
     fi
-
-    # 关键操作：仅设置参数，不 disable/enable
-    # 这会立即反映在新的 Beacon 帧中，且不会导致 phy1-apX 离开桥
     hostapd_cli -i "$bss" set ignore_broadcast_ssid "$target_hidden" >/dev/null 2>&1
-    
     log_message "INFO" "热点 $ssid ($bss) hidden=$target_hidden"
-    
-    # 同步 UCI 基线
     uci set wireless.$section.hidden="$target_hidden"
     uci commit wireless
     return 0
 }
 
+# ---------- 清理旧的 fwmark 规则和路由表 ----------
+cleanup_old_pbr() {
+    log_message "INFO" "清理旧的 fwmark 规则和路由表..."
+    # 删除旧的 ip rule fwmark 规则（优先级 29989-30000）
+    ip rule list | grep "fwmark" | awk '{print $NF}' | while read table; do
+        ip rule del fwmark 0x... lookup "$table" 2>/dev/null
+    done
+    # 删除旧的 pbr_vnt2_proxyXX 路由表
+    for t in pbr_vnt2_proxy00 pbr_vnt2_proxy01 pbr_vnt2_proxy02 pbr_vnt2_proxy03 pbr_vnt2_proxy04 \
+             pbr_vnt2_proxy05 pbr_vnt2_proxy06 pbr_vnt2_proxy07 pbr_vnt2_proxy08 pbr_vnt2_proxy09; do
+        ip route flush table "$t" 2>/dev/null
+    done
+    # 删除 nftables 中的 pbr 链（如果存在）
+    nft delete chain inet fw4 pbr_prerouting 2>/dev/null
+    nft delete chain inet fw4 pbr_forward 2>/dev/null
+    nft delete chain inet fw4 pbr_output 2>/dev/null
+    nft delete chain inet fw4 pbr_dstnat 2>/dev/null
+    for i in $(seq 1 11); do
+        hex=$(printf "%02x" $((i-1)))
+        nft delete chain inet fw4 "pbr_mark_0x${hex}0000" 2>/dev/null
+    done
+}
+
+# ---------- 动态配置策略路由 + NAT + 转发 ----------
+setup_policy_routing() {
+    log_message "INFO" "开始动态配置策略路由..."
+
+    # 清理旧规则（避免冲突）
+    cleanup_old_pbr
+
+    build_mapping > /tmp/vnt_mapping.tmp
+    while IFS=' ' read -r ssid vnt_dev peer_ip; do
+        [ -z "$ssid" ] && continue
+        idx="${vnt_dev#vnt_proxy}"
+        num=$((10#$idx))
+        net="192.168.$((100+num)).0/24"
+        table=$((100+num))
+
+        if ip link show "$vnt_dev" >/dev/null 2>&1; then
+            # 添加策略路由规则
+            ip rule add from "$net" table "$table" priority "$table" 2>/dev/null
+            # 添加默认路由
+            ip route replace default via "$peer_ip" dev "$vnt_dev" table "$table" 2>/dev/null
+            # 添加直连路由（修复关键缺失）
+            ip route replace "$peer_ip/32" dev "$vnt_dev" table "$table" 2>/dev/null
+            log_message "INFO" "策略路由: $net -> table $table (via $peer_ip dev $vnt_dev)"
+
+            # 添加 MASQUERADE（使用 nftables 的 srcnat 链）
+            nft add rule inet fw4 srcnat ip saddr "$net" oifname "$vnt_dev" masquerade 2>/dev/null
+            log_message "INFO" "MASQUERADE: $net -> $vnt_dev"
+
+            # 添加转发规则（允许 hotspot 到该 VNT 接口）
+            nft add rule inet fw4 forward_hotspot oifname "$vnt_dev" accept 2>/dev/null
+            log_message "INFO" "转发规则: forward_hotspot -> $vnt_dev 已允许"
+        else
+            log_message "WARN" "接口 $vnt_dev 尚未就绪，跳过配置（热点 $ssid 仍存在）"
+        fi
+    done < /tmp/vnt_mapping.tmp
+    rm -f /tmp/vnt_mapping.tmp
+}
+
 cleanup() {
     log_message "INFO" "收到终止信号，开始清理..."
-    echo "$MAPPING" | while read -r ssid vnt_dev peer_ip; do
+    build_mapping > /tmp/vnt_mapping.tmp
+    while IFS=' ' read -r ssid vnt_dev peer_ip; do
         [ -z "$ssid" ] && continue
         set_hotspot_hidden "$ssid" "1"
-    done
+    done < /tmp/vnt_mapping.tmp
+    rm -f /tmp/vnt_mapping.tmp
     rm -f "$PID_FILE"
     log_message "INFO" "清理完成，退出"
     exit 0
@@ -116,25 +169,29 @@ main_loop() {
     log_message "INFO" "VNT 热点管理器启动 (PID: $$)"
     trap cleanup SIGTERM SIGINT SIGQUIT
 
-    # 初始化状态目录
     mkdir -p "$STATE_DIR"
+
+    # 启动时配置策略路由、NAT、转发
+    setup_policy_routing
 
     # 基线校验：确保所有热点默认隐藏
     log_message "INFO" "校验热点隐藏基线..."
-    local baseline_changed=0
-    echo "$MAPPING" | while read -r ssid vnt_dev peer_ip; do
+    baseline_changed=0
+    build_mapping > /tmp/vnt_mapping.tmp
+    while IFS=' ' read -r ssid vnt_dev peer_ip; do
         [ -z "$ssid" ] && continue
-        local section=$(get_wssid_section "$ssid")
+        section=$(get_wifi_section "$ssid")
         if [ -n "$section" ]; then
-            local current_hidden=$(uci -q get wireless.$section.hidden || echo "0")
+            current_hidden=$(uci -q get wireless.$section.hidden || echo "0")
             if [ "$current_hidden" != "1" ]; then
                 log_message "WARN" "热点 $ssid 基线未隐藏，自动修正"
                 set_hotspot_hidden "$ssid" "1"
                 baseline_changed=1
             fi
         fi
-    done
-    
+    done < /tmp/vnt_mapping.tmp
+    rm -f /tmp/vnt_mapping.tmp
+
     if [ "$baseline_changed" -eq 1 ]; then
         log_message "INFO" "基线修正完成"
     else
@@ -143,14 +200,16 @@ main_loop() {
 
     # 主循环
     while true; do
-        echo "$MAPPING" | while read -r ssid vnt_dev peer_ip; do
+        build_mapping > /tmp/vnt_mapping.tmp
+        while IFS=' ' read -r ssid vnt_dev peer_ip; do
             [ -z "$ssid" ] && continue
             if check_vnt_connectivity "$vnt_dev" "$peer_ip"; then
-                set_hotspot_hidden "$ssid" "0" # VNT 通 -> 显示
+                set_hotspot_hidden "$ssid" "0"
             else
-                set_hotspot_hidden "$ssid" "1" # VNT 断 -> 隐藏
+                set_hotspot_hidden "$ssid" "1"
             fi
-        done
+        done < /tmp/vnt_mapping.tmp
+        rm -f /tmp/vnt_mapping.tmp
         sleep "$CHECK_INTERVAL"
     done
 }
@@ -159,7 +218,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 echo $$ > "$PID_FILE"
 
 # 依赖检查
-for cmd in ping ip uci hostapd_cli; do
+for cmd in ping ip uci hostapd_cli nft; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         log_message "ERROR" "依赖命令 $cmd 不存在，退出"
         rm -f "$PID_FILE"
