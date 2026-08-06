@@ -6,7 +6,7 @@ LUCI_PKGARCH:=all
 
 PKG_NAME:=luci-app-vnt2
 PKG_VERSION:=1.6.7
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 PKG_PO_VERSION:=$(PKG_VERSION)
 
 LUCI_MINIFY_JS:=0
@@ -46,6 +46,8 @@ endef
 define Package/$(PKG_NAME)/install
 	$(INSTALL_DIR) $(1)/etc/vnt
 	$(INSTALL_BIN) ./root/etc/vnt/vnt-hotspot-manager $(1)/etc/vnt/vnt-hotspot-manager
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./root/etc/init.d/vnt-hotspot-manager $(1)/etc/init.d/vnt-hotspot-manager
 endef
 
 $(eval $(call BuildPackage,$(PKG_NAME)))
