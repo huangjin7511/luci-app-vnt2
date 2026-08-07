@@ -1,13 +1,18 @@
 #!/bin/sh
 # /etc/vnt/vnt-hotspot-manager
 # KWRT VNT 隧道监控 + Hostapd-CLI 热点隐藏控制器
+# 策略路由 + UCI 化 NAT（由 fw4 渲染，避免裸插 nft 被 reload 冲掉）
 # 动态根据 UCI 中存在的 proxy00~proxy0n 热点 SSID 生成映射
-# 集成策略路由、NAT、转发规则
 
 PROG=/etc/vnt/vnt-hotspot-manager
 PID_FILE=/var/run/vnt-hotspot-manager.pid
 LOG_FILE="/var/log/vnt-hotspot.log"
 STATE_DIR="/var/run/vnt-hotspot-state"
+
+# VNT 隧道所在的 firewall zone（与 vnt2 脚本保持一致）
+VNT_FW_ZONE="vnt2_vnt"
+# 热点客户端所在 zone（若不存在会自动创建）
+HOTSPOT_FW_ZONE="hotspot"
 
 # 检测间隔（秒）
 CHECK_INTERVAL=10
@@ -91,65 +96,28 @@ set_hotspot_hidden() {
     return 0
 }
 
-# ---------- 清理旧的 fwmark 规则和路由表 ----------
-cleanup_old_pbr() {
-    log_message "INFO" "清理旧的 fwmark 规则和路由表..."
-    # 删除旧的 ip rule fwmark 规则（优先级 29989-30000）
-    ip rule list | grep "fwmark" | awk '{print $NF}' | while read table; do
-        ip rule del fwmark 0x... lookup "$table" 2>/dev/null
-    done
-    # 删除旧的 pbr_vnt2_proxyXX 路由表
-    for t in pbr_vnt2_proxy00 pbr_vnt2_proxy01 pbr_vnt2_proxy02 pbr_vnt2_proxy03 pbr_vnt2_proxy04 \
-             pbr_vnt2_proxy05 pbr_vnt2_proxy06 pbr_vnt2_proxy07 pbr_vnt2_proxy08 pbr_vnt2_proxy09; do
-        ip route flush table "$t" 2>/dev/null
-    done
-    # 删除 nftables 中的 pbr 链（如果存在）
-    nft delete chain inet fw4 pbr_prerouting 2>/dev/null
-    nft delete chain inet fw4 pbr_forward 2>/dev/null
-    nft delete chain inet fw4 pbr_output 2>/dev/null
-    nft delete chain inet fw4 pbr_dstnat 2>/dev/null
-    for i in $(seq 1 11); do
-        hex=$(printf "%02x" $((i-1)))
-        nft delete chain inet fw4 "pbr_mark_0x${hex}0000" 2>/dev/null
-    done
+# ---------- 确保热点 firewall zone 存在 ----------
+ensure_hotspot_zone() {
+    local sid
+    sid=$(uci -q show firewall | grep "firewall..*.name='${HOTSPOT_FW_ZONE}'" | cut -d. -f2 | cut -d= -f1)
+    if [ -z "$sid" ]; then
+        sid=$(uci add firewall zone)
+        uci set "firewall.${sid}.name=${HOTSPOT_FW_ZONE}"
+        uci set "firewall.${sid}.input=ACCEPT"
+        uci set "firewall.${sid}.output=ACCEPT"
+        uci set "firewall.${sid}.forward=REJECT"
+        uci set "firewall.${sid}.masq=0"
+        log_message "INFO" "创建 hotspot zone: $HOTSPOT_FW_ZONE"
+    fi
 }
 
-# ---------- 动态配置策略路由 + NAT + 转发 ----------
-setup_policy_routing() {
-    log_message "INFO" "开始动态配置策略路由..."
-
-    # 清理旧规则（避免冲突）
-    cleanup_old_pbr
-
-    build_mapping > /tmp/vnt_mapping.tmp
-    while IFS=' ' read -r ssid vnt_dev peer_ip; do
-        [ -z "$ssid" ] && continue
-        idx="${vnt_dev#vnt_proxy}"
-        num=$((10#$idx))
-        net="192.168.$((100+num)).0/24"
-        table=$((100+num))
-
-        if ip link show "$vnt_dev" >/dev/null 2>&1; then
-            # 添加策略路由规则
-            ip rule add from "$net" table "$table" priority "$table" 2>/dev/null
-            # 添加默认路由
-            ip route replace default via "$peer_ip" dev "$vnt_dev" table "$table" 2>/dev/null
-            # 添加直连路由（修复关键缺失）
-            ip route replace "$peer_ip/32" dev "$vnt_dev" table "$table" 2>/dev/null
-            log_message "INFO" "策略路由: $net -> table $table (via $peer_ip dev $vnt_dev)"
-
-            # 添加 MASQUERADE（使用 nftables 的 srcnat 链）
-            nft add rule inet fw4 srcnat ip saddr "$net" oifname "$vnt_dev" masquerade 2>/dev/null
-            log_message "INFO" "MASQUERADE: $net -> $vnt_dev"
-
-            # 添加转发规则（允许 hotspot 到该 VNT 接口）
-            nft add rule inet fw4 forward_hotspot oifname "$vnt_dev" accept 2>/dev/null
-            log_message "INFO" "转发规则: forward_hotspot -> $vnt_dev 已允许"
-        else
-            log_message "WARN" "接口 $vnt_dev 尚未就绪，跳过配置（热点 $ssid 仍存在）"
-        fi
-    done < /tmp/vnt_mapping.tmp
-    rm -f /tmp/vnt_mapping.tmp
+# 把热点接口加入 hotspot zone
+add_iface_to_hotspot_zone() {
+    local wlan_iface="$1"
+    local sid
+    sid=$(uci -q show firewall | grep "firewall..*.name='${HOTSPOT_FW_ZONE}'" | cut -d. -f2 | cut -d= -f1)
+    [ -z "$sid" ] && return
+    uci add_list "firewall.${sid}.network=${wlan_iface}" 2>/dev/null
 }
 
 cleanup() {
@@ -160,6 +128,7 @@ cleanup() {
         set_hotspot_hidden "$ssid" "1"
     done < /tmp/vnt_mapping.tmp
     rm -f /tmp/vnt_mapping.tmp
+
     rm -f "$PID_FILE"
     log_message "INFO" "清理完成，退出"
     exit 0
@@ -170,9 +139,6 @@ main_loop() {
     trap cleanup SIGTERM SIGINT SIGQUIT
 
     mkdir -p "$STATE_DIR"
-
-    # 启动时配置策略路由、NAT、转发
-    setup_policy_routing
 
     # 基线校验：确保所有热点默认隐藏
     log_message "INFO" "校验热点隐藏基线..."
@@ -218,7 +184,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 echo $$ > "$PID_FILE"
 
 # 依赖检查
-for cmd in ping ip uci hostapd_cli nft; do
+for cmd in ping ip uci hostapd_cli; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         log_message "ERROR" "依赖命令 $cmd 不存在，退出"
         rm -f "$PID_FILE"
