@@ -1,4 +1,9 @@
 #!/bin/sh /etc/rc.common
+# /etc/init.d/vnt-hotspot-manager
+# KWRT VNT 隧道监控 + Hostapd-CLI 热点隐藏控制器
+# Procd 初始化脚本 & 主守护进程合二为一
+# 策略路由由 pbr 服务管理，不再手动操作 ip rule/route
+# 动态根据 UCI 中存在的 proxy00~proxy0n 热点 SSID 生成映射
 
 START=99
 STOP=10
@@ -8,10 +13,226 @@ NAME=vnt-hotspot-manager
 PROG=/etc/vnt/vnt-hotspot-manager
 PID_FILE=/var/run/vnt-hotspot-manager.pid
 LOG_FILE=/var/log/vnt-hotspot.log
+STATE_DIR=/var/run/vnt-hotspot-state
+
+# VNT 隧道所在的 firewall zone（与 vnt2 脚本保持一致）
+VNT_FW_ZONE="vnt_tunnel"
+# 热点客户端所在 zone（若不存在会自动创建）
+HOTSPOT_FW_ZONE="hotspot"
+
+# 检测间隔（秒）
+CHECK_INTERVAL=10
+# Ping 检测参数
+PING_COUNT=3
+PING_TIMEOUT=2
+
+# ======================== 工具函数 ========================
+
+log_message() {
+    local level="$1"
+    local msg="$2"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $msg" >> "$LOG_FILE"
+}
+
+# 动态构建映射表：proxyXX → vnt_proxyXX → 10.26.0.(100+XX)
+build_mapping() {
+    uci show wireless | grep "=wifi-iface" | while IFS='=' read -r section _; do
+        local cur_ssid
+        cur_ssid=$(uci -q get "${section}.ssid" 2>/dev/null)
+        case "$cur_ssid" in
+            proxy[0-9][0-9])
+                local idx="${cur_ssid#proxy}"
+                local num=$((10#$idx))
+                local vnt_dev="vnt_proxy${idx}"
+                local peer_ip="10.26.0.$((100+num))"
+                echo "${cur_ssid} ${vnt_dev} ${peer_ip}"
+                ;;
+        esac
+    done | sort -k1
+}
+
+# 根据 SSID 查找 UCI wireless section 名
+get_wifi_section() {
+    local ssid="$1"
+    uci show wireless | grep "=wifi-iface" | while IFS='=' read -r section _; do
+        local cur_ssid
+        cur_ssid=$(uci -q get "${section}.ssid")
+        if [ "$cur_ssid" = "$ssid" ]; then
+            echo "${section#wireless.}"
+            break
+        fi
+    done
+}
+
+# 根据 SSID 查找 hostapd BSS socket 名
+get_bss_by_ssid() {
+    local target_ssid="$1"
+    local hostapd_dir="/var/run/hostapd"
+    [ -d "$hostapd_dir" ] || hostapd_dir=$(find /var/run -name "hostapd*" -type d | head -1)
+    [ -z "$hostapd_dir" ] || [ ! -d "$hostapd_dir" ] && return
+
+    local bss_socket
+    for bss_socket in "$hostapd_dir"/*; do
+        [ -S "$bss_socket" ] || continue
+        local bss_name
+        bss_name=$(basename "$bss_socket")
+        local current_ssid
+        current_ssid=$(hostapd_cli -s "$hostapd_dir" -i "$bss_name" get_config 2>/dev/null | grep "^ssid=" | cut -d'=' -f2)
+        if [ "$current_ssid" = "$target_ssid" ]; then
+            echo "$bss_name"
+            return
+        fi
+    done
+}
+
+# 检测 VNT 隧道连通性（接口 UP + ping 对端）
+check_vnt_connectivity() {
+    local vnt_dev="$1"
+    local peer_ip="$2"
+    ip link show "$vnt_dev" 2>/dev/null | grep -q "LOWER_UP" || return 1
+    ping -I "$vnt_dev" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$peer_ip" >/dev/null 2>&1
+}
+
+# 设置热点隐藏状态；状态未变化则返回 1
+set_hotspot_hidden() {
+    local ssid="$1"
+    local target_hidden="$2"
+    local bss
+    bss=$(get_bss_by_ssid "$ssid")
+    local section
+    section=$(get_wifi_section "$ssid")
+    if [ -z "$bss" ] || [ -z "$section" ]; then
+        return 1
+    fi
+    local current_hidden
+    current_hidden=$(uci -q get wireless.$section.hidden || echo "0")
+    if [ "$current_hidden" = "$target_hidden" ]; then
+        return 1
+    fi
+    hostapd_cli -i "$bss" set ignore_broadcast_ssid "$target_hidden" >/dev/null 2>&1
+    log_message "INFO" "热点 $ssid ($bss) hidden=$target_hidden"
+    uci set wireless.$section.hidden="$target_hidden"
+    uci commit wireless
+    return 0
+}
+
+# 确保 hotspot firewall zone 存在
+ensure_hotspot_zone() {
+    local sid
+    sid=$(uci -q show firewall | grep "firewall..*.name='${HOTSPOT_FW_ZONE}'" | cut -d. -f2 | cut -d= -f1)
+    if [ -z "$sid" ]; then
+        sid=$(uci add firewall zone)
+        uci set "firewall.${sid}.name=${HOTSPOT_FW_ZONE}"
+        uci set "firewall.${sid}.input=ACCEPT"
+        uci set "firewall.${sid}.output=ACCEPT"
+        uci set "firewall.${sid}.forward=REJECT"
+        uci set "firewall.${sid}.masq=0"
+        uci commit firewall
+        log_message "INFO" "创建 hotspot zone: $HOTSPOT_FW_ZONE"
+    fi
+}
+
+# 确保 pbr 服务运行（策略路由由 pbr 管理）
+ensure_pbr_running() {
+    log_message "INFO" "检查 pbr 服务状态..."
+    if ! /etc/init.d/pbr enabled 2>/dev/null; then
+        /etc/init.d/pbr enable
+        log_message "INFO" "pbr 服务已启用"
+    fi
+    if ! /etc/init.d/pbr running 2>/dev/null; then
+        /etc/init.d/pbr start
+        log_message "INFO" "pbr 服务已启动"
+    else
+        log_message "INFO" "pbr 服务已在运行"
+    fi
+}
+
+# 依赖检查
+check_dependencies() {
+    local cmd
+    for cmd in ping ip uci hostapd_cli; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            log_message "ERROR" "依赖命令 $cmd 不存在，退出"
+            return 1
+        fi
+    done
+    return 0
+}
+
+# ======================== 主循环（守护进程逻辑） ========================
+
+main_loop() {
+    log_message "INFO" "VNT 热点管理器启动 (PID: $$)"
+    trap cleanup SIGTERM SIGINT SIGQUIT
+
+    mkdir -p "$STATE_DIR"
+
+    # 确保 pbr 服务运行（策略路由由 pbr 管理）
+    ensure_pbr_running
+
+    # 基线校验：确保所有 proxy 热点默认隐藏
+    log_message "INFO" "校验热点隐藏基线..."
+    local baseline_changed=0
+    build_mapping > /tmp/vnt_mapping.tmp
+    while IFS=' ' read -r ssid vnt_dev peer_ip; do
+        [ -z "$ssid" ] && continue
+        local section
+        section=$(get_wifi_section "$ssid")
+        if [ -n "$section" ]; then
+            local current_hidden
+            current_hidden=$(uci -q get wireless.$section.hidden || echo "0")
+            if [ "$current_hidden" != "1" ]; then
+                log_message "WARN" "热点 $ssid 基线未隐藏，自动修正"
+                set_hotspot_hidden "$ssid" "1"
+                baseline_changed=1
+            fi
+        fi
+    done < /tmp/vnt_mapping.tmp
+    rm -f /tmp/vnt_mapping.tmp
+
+    if [ "$baseline_changed" -eq 1 ]; then
+        log_message "INFO" "基线修正完成"
+    else
+        log_message "INFO" "所有热点基线已隐藏，无需修正"
+    fi
+
+    # 主循环：持续监控隧道连通性并控制热点可见性
+    while true; do
+        build_mapping > /tmp/vnt_mapping.tmp
+        while IFS=' ' read -r ssid vnt_dev peer_ip; do
+            [ -z "$ssid" ] && continue
+            if check_vnt_connectivity "$vnt_dev" "$peer_ip"; then
+                set_hotspot_hidden "$ssid" "0"
+            else
+                set_hotspot_hidden "$ssid" "1"
+            fi
+        done < /tmp/vnt_mapping.tmp
+        rm -f /tmp/vnt_mapping.tmp
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
+# 清理函数（收到终止信号时调用）
+cleanup() {
+    log_message "INFO" "收到终止信号，开始清理..."
+    build_mapping > /tmp/vnt_mapping.tmp
+    while IFS=' ' read -r ssid vnt_dev peer_ip; do
+        [ -z "$ssid" ] && continue
+        set_hotspot_hidden "$ssid" "1"
+    done < /tmp/vnt_mapping.tmp
+    rm -f /tmp/vnt_mapping.tmp
+
+    rm -f "$PID_FILE"
+    log_message "INFO" "清理完成，退出"
+    exit 0
+}
+
+# ======================== Procd 服务函数 ========================
 
 start_service() {
     echo "启动 VNT 热点管理器..."
-    # 检查主程序是否存在
+
+    # 检查主程序是否存在（self-check，因合并后 PROG 指向自身）
     [ -f "$PROG" ] || {
         echo "错误：$PROG 不存在，请先部署主程序"
         exit 1
@@ -23,9 +244,15 @@ start_service() {
     touch "$LOG_FILE"
     chmod 644 "$LOG_FILE"
 
+    # 依赖检查
+    check_dependencies || exit 1
+
+    # 确保 hotspot firewall zone 存在
+    ensure_hotspot_zone
+
     # Procd 托管配置（前台运行，自动重启）
     procd_open_instance "$NAME"
-    procd_set_param command "$PROG"
+    procd_set_param command "$PROG" run
     procd_set_param pidfile "$PID_FILE"
     procd_set_param stdout 1   # 日志重定向到系统日志
     procd_set_param stderr 1
@@ -35,25 +262,30 @@ start_service() {
 
 stop_service() {
     echo "停止 VNT 热点管理器..."
+
     # 终止主进程
     if [ -f "$PID_FILE" ]; then
-        local pid=$(cat "$PID_FILE")
+        local pid
+        pid=$(cat "$PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid"
             # 等待进程优雅退出
+            local i
             for i in $(seq 1 5); do
                 kill -0 "$pid" 2>/dev/null || break
                 sleep 1
             done
+            # 若仍未退出，强制 kill
+            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
         fi
         rm -f "$PID_FILE"
     fi
 
-    # 兜底隐藏所有热点（防止主进程异常退出未清理）
+    # 兜底隐藏所有 proxy 热点（防止主进程异常退出未清理）
     echo "兜底隐藏所有 proxy 热点..."
     . /lib/functions.sh
     config_load wireless
-    config_foreach() {
+    config_foreach_wifi() {
         local section="$1"
         local ssid ifname
         config_get ssid "$section" ssid
@@ -71,7 +303,7 @@ stop_service() {
                 ;;
         esac
     }
-    config_foreach wifi-iface
+    config_foreach config_foreach_wifi wifi-iface
     uci commit wireless
     echo "兜底清理完成"
 }
@@ -86,3 +318,20 @@ reload() {
     # 不支持热重载，直接重启
     restart
 }
+
+# ======================== 入口分发 ========================
+# 当 Procd 以 "run" 参数调用时，进入主循环（守护进程模式）
+# 否则作为 init.d 脚本由 procd 解析 START/STOP/USE_PROCD 等元数据
+
+case "${1:-}" in
+    run)
+        # 守护进程模式：由 procd_set_param command "$PROG" run 触发
+        mkdir -p "$(dirname "$LOG_FILE")"
+        echo $$ > "$PID_FILE"
+        main_loop
+        ;;
+    *)
+        # 交给 procd 处理 start|stop|restart|reload|enable|disable 等
+        :
+        ;;
+esac
