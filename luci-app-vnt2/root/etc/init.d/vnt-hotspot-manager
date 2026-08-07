@@ -10,7 +10,7 @@ STOP=10
 USE_PROCD=1
 
 NAME=vnt-hotspot-manager
-PROG=/etc/vnt/vnt-hotspot-manager
+PROG=/usr/bin/vnt-hotspot-manager
 PID_FILE=/var/run/vnt-hotspot-manager.pid
 LOG_FILE=/var/log/vnt-hotspot.log
 STATE_DIR=/var/run/vnt-hotspot-state
