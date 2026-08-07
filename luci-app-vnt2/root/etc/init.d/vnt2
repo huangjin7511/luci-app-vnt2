@@ -17,7 +17,7 @@ INITD="/etc/init.d"
 IFACE_PREFIX="vnt2"
 RESPAWN_THRESHOLD=3600
 RESPAWN_TIMEOUT=5
-RESPAWN_RETRY=5
+RESPAWN_RETRY=10000
 ROUTE_FIX_LOCK="${LOG_DIR}/vnt2_route_fixing"
 
 VNT_PORT_FIELDS="tcp_bind quic_bind ws_bind"
@@ -437,7 +437,7 @@ _try_fix_cidr() {
         grep -qF "$lan_cidr" "$conf" 2>/dev/null || continue
         tun_name=$(get_tun_name "$name" "vnt")
         [ -z "$tun_name" ] && continue
-        ip route replace "$lan_cidr" dev "$tun_name" 2>/dev/null || continue
+        # ip route replace "$lan_cidr" dev "$tun_name" 2>/dev/null || continue
         _instance_log "$name" "Fix route: ${lan_cidr} dev ${tun_name}"
         ping -c1 -W2 "$lan_gw" > /dev/null 2>&1 && {
             echo "$lan_cidr" >> "$_FIXED_CIDRS"
@@ -538,7 +538,7 @@ start_service() {
     fi
     each_enabled_instance _do_start_instance
     rebuild_network_interfaces
-    rebuild_firewall
+    # rebuild_firewall
     fix_all_routes
 }
 
@@ -546,14 +546,14 @@ stop_service() {
     each_all_instance _cleanup_tun
     cleanup_network_interfaces
     cleanup_fw
-    uci commit firewall
-    _fw_reload
+    # uci commit firewall
+    # _fw_reload
 }
 
 reload_service() {
     init_paths
     setup_cron
     rebuild_network_interfaces
-    rebuild_firewall
+    # rebuild_firewall
     fix_all_routes
 }
