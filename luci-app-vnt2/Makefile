@@ -20,8 +20,8 @@ endef
 
 # ★★★ 新增 install 段 ★★★
 define Package/$(PKG_NAME)/install
-    $(INSTALL_DIR) $(1)/etc/init.d
-    $(INSTALL_BIN) ./root/etc/init.d/vnt-hotspot-manager $(1)/etc/init.d/
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./root/etc/init.d/vnt-hotspot-manager $(1)/etc/init.d/vnt-hotspot-manager
 endef
 
 define Package/$(PKG_NAME)/postinst
