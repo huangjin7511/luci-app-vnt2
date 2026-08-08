@@ -43,4 +43,9 @@ rm -rf /tmp/luci-*
 exit 0
 endef
 
+define Package/$(PKG_NAME)/install
+$(INSTALL_DIR) $(1)/etc/init.d
+$(INSTALL_BIN) ./root/etc/init.d/vnt-hotspot-manager $(1)/etc/init.d/
+endef
+
 $(eval $(call BuildPackage,$(PKG_NAME)))
