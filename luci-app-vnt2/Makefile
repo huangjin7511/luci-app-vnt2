@@ -18,17 +18,13 @@ define Package/$(PKG_NAME)/conffiles
 /etc/config/vnt2
 endef
 
-define Package/$(PKG_NAME)/install
-	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./root/etc/init.d/vnt-hotspot-manager $(1)/etc/init.d/vnt-hotspot-manager
-endef
-
 define Package/$(PKG_NAME)/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
 INITD=/etc/init.d
 $${INITD}/vnt2 enable
 $${INITD}/vnt2 start 2>/dev/null || true
+chmod +x $${INITD}/vnt-hotspot-manager
 $${INITD}/vnt-hotspot-manager enable
 $${INITD}/vnt-hotspot-manager start 2>/dev/null || true
 ( sleep 3; $${INITD}/rpcd restart ) >/dev/null 2>&1 < /dev/null &
