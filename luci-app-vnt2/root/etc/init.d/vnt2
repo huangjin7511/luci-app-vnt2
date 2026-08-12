@@ -528,6 +528,7 @@ service_triggers() {
 
 start_service() {
     init_paths
+	procd_set_param limits nofile="65535 65535"
     echo "VNT2: starting all enabled instances..."
     if [ ! -x "${BIN_PATH}/vnt2_cli" ] || [ ! -x "${BIN_PATH}/vnts2" ]; then
         [ -x "$UPDATE_SCRIPT" ] && {
