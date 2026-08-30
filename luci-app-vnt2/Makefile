@@ -5,8 +5,8 @@ LUCI_DEPENDS:=+luci-base +luci-compat +kmod-tun
 LUCI_PKGARCH:=all
 
 PKG_NAME:=luci-app-vnt2
-PKG_VERSION:=1.6.8
-PKG_RELEASE:=2
+PKG_VERSION:=1.6.9
+PKG_RELEASE:=1
 PKG_PO_VERSION:=$(PKG_VERSION)
 
 LUCI_MINIFY_JS:=0
