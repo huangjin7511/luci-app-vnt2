@@ -26,7 +26,7 @@ define Package/$(PKG_NAME)/postinst
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
 INITD=/etc/init.d
 $${INITD}/vnt2 enable
-$${INITD}/vnt2 start || true
+( setsid "$${INITD}/vnt2" start </dev/null >/dev/null 2>&1 & )
 $${INITD}/rpcd reload >/dev/null 2>&1 || true
 rm -rf /tmp/luci-*
 
@@ -44,3 +44,4 @@ exit 0
 endef
 
 $(eval $(call BuildPackage,$(PKG_NAME)))
+
