@@ -16,10 +16,10 @@ FW_PENDING="${RUN_DIR}/fw_pending"
 FW_WORKER_LOCK="${RUN_DIR}/fw_worker.lock"
 FW_ACTIVE="${RUN_DIR}/fw_active"
 CRON_TAG="vnt2_auto_update"
-UPDATE_SCRIPT="/usr/libexec/vnt2-update.sh"
+UPDATE_SCRIPT="/usr/libexec/vnt2/vnt2-update.sh"
 CRON_FILE="/etc/crontabs/root"
 FW_ZONE="vnt2_vnt"
-VNT_RUN="/usr/libexec/vnt2-run.sh"
+VNT_RUN="/usr/libexec/vnt2/vnt2-run.sh"
 INITD="/etc/init.d"
 IFACE_PREFIX="vnt2"
 RESPAWN_THRESHOLD=3600
@@ -675,7 +675,7 @@ _do_start_vnt_web() {
     procd_set_param pidfile "/var/run/vnt2_${WEB_INSTANCE}.pid"
     procd_close_instance
     _instance_log "$WEB_INSTANCE" "Registered vnt2_web addr=${WEB_ADDR}"
-    [ "$skip_sync" = "1" ] || setsid /usr/libexec/vnt2-web-sync.sh >/dev/null 2>&1 1000>&- &
+    [ "$skip_sync" = "1" ] || setsid /usr/libexec/vnt2/vnt2-web-sync.sh >/dev/null 2>&1 1000>&- &
 }
 
 _do_start_instance() {
