@@ -358,7 +358,9 @@ _remove_all_vnt2_ifaces() {
 
 rebuild_network_interfaces() {
     _remove_all_vnt2_ifaces
-    each_enabled_vnts _create_iface
+    # 对 vnt 客户端 + vnts 服务端全部注册进 network uci，
+    # 让 pbr/LuCI 能扫描到这些 interface
+    each_enabled_instance _create_iface
     uci commit network
     "$INITD/network" reload 2>/dev/null
 }
