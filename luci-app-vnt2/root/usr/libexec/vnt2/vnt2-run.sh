@@ -8,9 +8,11 @@ shift 3
 
 CHECK_INTERVAL=100
 KILL_RECORD="/tmp/vnt2_log/vnt2_kill_record"
+ROUTE_FIX_LOCK="/tmp/vnt2_log/vnt2_route_fixing"
 KILL_KEY="${NAME}.${INSTANCE_TYPE}"
 SELF_PID=$$
 START_TIME=$(date +%s)
+ROUTE_FIXED=0
 KILL_INTERVAL="${KILL_INTERVAL:-$(uci get vnt2.global.kill_interval 2>/dev/null || echo 1800)}"
 STARTUP_CHECK_WINDOW="${STARTUP_CHECK_WINDOW:-$(uci get vnt2.global.startup_check_window 2>/dev/null || echo 60)}"
 GOT_PUBLIC_ADDR=0
@@ -282,6 +284,18 @@ reader_loop() {
 
         _web_watch_line "$line"
 
+        case "$line" in
+            *"连接服务器失败"*|*"kind: AlreadyExists"*)
+                if [ "$ROUTE_FIXED" = "0" ] && _network_ok; then
+                    ROUTE_FIXED=1
+                    if mkdir "$ROUTE_FIX_LOCK" 2>/dev/null; then
+                        log "Server failure detected, fixing routes..."
+                        setsid sh -c '/etc/init.d/vnt2 fix_routes' > /dev/null 2>&1 &
+                    fi
+                fi
+                ;;
+        esac
+
         if _line_has_key "$line" "$FAULT_RESTART_KEYS"; then
             if [ "$ONLINE" = "0" ]; then
                 if _network_ok; then
@@ -296,6 +310,7 @@ reader_loop() {
             else
                 GOT_PUBLIC_ADDR=1
                 ONLINE=1
+                ROUTE_FIXED=0
             fi
         fi
 

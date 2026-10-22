@@ -4,9 +4,10 @@
 START=99
 STOP=10
 USE_PROCD=1
-EXTRA_COMMANDS="fw_reload_now fw_purge"
+EXTRA_COMMANDS="fw_reload_now fw_purge fix_routes"
 EXTRA_HELP="	fw_reload_now            Reload fw4 rules quietly, start firewall if not loaded
-	fw_purge                 Remove all vnt2 firewall rules synchronously"
+	fw_purge                 Remove all vnt2 firewall rules synchronously
+	fix_routes               Probe and fix LAN side routes for enabled vnt instances"
 
 BIN_PATH="/usr/bin"
 CONFIG_PATH="/etc/vnt2_config"
@@ -24,7 +25,7 @@ INITD="/etc/init.d"
 IFACE_PREFIX="vnt2"
 RESPAWN_THRESHOLD=3600
 RESPAWN_TIMEOUT=5
-RESPAWN_RETRY=5
+RESPAWN_RETRY=10000
 STARTUP_CHECK_WINDOW=60
 KILL_INTERVAL=1800
 WEB_TOKEN=""
@@ -32,6 +33,7 @@ WEB_ADDR="0.0.0.0:19099"
 WEB_ENABLED="1"
 WEB_DATA_DIR="/vnt_config"
 WEB_INSTANCE="vnt2_web"
+ROUTE_FIX_LOCK="${LOG_DIR}/vnt2_route_fixing"
 
 VNT_PORT_FIELDS="tcp_bind quic_bind ws_bind tunnel_port tunnel_addr"
 VNTS_PORT_FIELDS="tcp_bind quic_bind ws_bind server_quic_bind"
@@ -642,6 +644,68 @@ get_bin_args() {
     cmd=$(render_template "$tpl" "$bin" "$conf" "$name" "$type")
     cmdline_to_pipes "$cmd"
 }
+_try_fix_cidr() {
+    local lan_cidr="$1"
+    local name sid key conf tun_name lan_gw tmp enabled
+    lan_gw=$(printf '%s' "$lan_cidr" | cut -d'/' -f1 | sed 's/\.[0-9]*$/.1/')
+    tmp=$(make_tmp)
+    uci -q show vnt2 | grep -E "^vnt2\.[^.]*=vnt$" > "$tmp"
+    while IFS='=' read -r key _; do
+        sid=$(printf '%s' "$key" | cut -d. -f2)
+        name=$(uci -q get "vnt2.${sid}.name")
+        enabled=$(uci -q get "vnt2.${sid}.enabled")
+        [ -z "$name" ] || [ "$enabled" != "1" ] && continue
+        conf="${CONFIG_PATH}/${name}.vnt"
+        [ -f "$conf" ] || continue
+        grep -qF "$lan_cidr" "$conf" 2>/dev/null || continue
+        tun_name=$(get_tun_name "$name" "vnt")
+        [ -z "$tun_name" ] && continue
+        # ip route replace "$lan_cidr" dev "$tun_name" 2>/dev/null || continue
+        _instance_log "$name" "Fix route: ${lan_cidr} dev ${tun_name}"
+        ping -c1 -W2 "$lan_gw" > /dev/null 2>&1 && {
+            echo "$lan_cidr" >> "$_FIXED_CIDRS"
+            rm -f "$tmp"
+            return
+        }
+        _instance_log "$name" "Route switched but still unreachable, try next..."
+    done < "$tmp"
+    rm -f "$tmp"
+}
+
+_collect_cidrs() {
+    local name="$1" type="$2"
+    [ "$type" = "vnts" ] && return
+    local conf="${CONFIG_PATH}/${name}.${type}"
+    local entry lan_cidr
+    grep -qE "^input[[:space:]]*=" "$conf" 2>/dev/null || return
+    for entry in $(grep -E "^input[[:space:]]*=" "$conf" 2>/dev/null \
+        | grep -oE '"[^"]+"' | tr -d '"'); do
+        lan_cidr=$(printf '%s' "$entry" | cut -d',' -f1)
+        [ -z "$lan_cidr" ] && continue
+        printf '%s' "$lan_cidr" \
+            | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' || continue
+        grep -qF "$lan_cidr" "$_ALL_CIDRS" 2>/dev/null && continue
+        echo "$lan_cidr" >> "$_ALL_CIDRS"
+    done
+}
+
+fix_all_routes() {
+    _ALL_CIDRS=$(make_tmp)
+    _FIXED_CIDRS=$(make_tmp)
+    each_enabled_instance _collect_cidrs
+    while read -r cidr; do
+        grep -qF "$cidr" "$_FIXED_CIDRS" 2>/dev/null && continue
+        _try_fix_cidr "$cidr"
+    done < "$_ALL_CIDRS"
+    rm -f "$_ALL_CIDRS" "$_FIXED_CIDRS"
+    rmdir "$ROUTE_FIX_LOCK" 2>/dev/null
+}
+
+fix_routes() {
+    init_paths
+    fix_all_routes
+}
+
 _cleanup_tun() {
     local name="$1" type="$2" tun_name="$3"
     [ -n "$tun_name" ] && ip link delete "$tun_name" 2>/dev/null
@@ -737,6 +801,7 @@ start_service() {
     esac
     init_paths
     setup_cron
+    procd_set_param limits nofile="65535 65535"
     local b need_vnt="" need_vnts="" projects=""
     for b in $(_install_selection); do
         case "$b" in
@@ -763,14 +828,16 @@ start_service() {
     fi
     each_enabled_instance _do_start_instance
     rebuild_network_interfaces
-    : > "$FW_ACTIVE"
-    fw_worker_request
+    # 防火墙由用户自行管理（pbr 等），不启用 vnt2 自动防火墙
+    # : > "$FW_ACTIVE"
+    # fw_worker_request
+    fix_all_routes
 }
 
 stop_service() {
     rm -f "$FW_ACTIVE"
     each_enabled_instance _cleanup_tun
     cleanup_network_interfaces
-    fw_worker_request
+    # fw_worker_request
 }
 

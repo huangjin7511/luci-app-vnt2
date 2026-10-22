@@ -24,8 +24,9 @@ pkg_upgrading() {
 }
 
 do_prerm() {
-    rm -f "$PURGE_LIST"
-    if pkg_upgrading "$@"; then
+	rm -f "$PURGE_LIST"
+	"$INITD/vnt-hotspot-manager" stop 2>/dev/null || true
+	if pkg_upgrading "$@"; then
         : > "$UPGRADE_MARKER"
         return 0
     fi
@@ -94,6 +95,9 @@ do_postinst() {
             "$INITD/vnt2" enable
             ( setsid "$INITD/vnt2" start </dev/null >/dev/null 2>&1 & )
         fi
+        chmod +x "$INITD/vnt-hotspot-manager" 2>/dev/null
+        "$INITD/vnt-hotspot-manager" enable 2>/dev/null || true
+        ( setsid "$INITD/vnt-hotspot-manager" start </dev/null >/dev/null 2>&1 & )
     fi
 
     "$INITD/rpcd" reload >/dev/null 2>&1 || true
