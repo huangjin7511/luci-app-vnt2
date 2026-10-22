@@ -132,23 +132,32 @@ get_tun_name() {
     [ -f "$conf" ] && read_field "$conf" "tun_name"
 }
 
-# 向 TOML 风格 config 文件里追加 tun_name 字段（已存在则不动）
-_append_tun_name() {
+# 写入或更新 TOML 风格 config 文件中的 tun_name 字段
+_set_tun_name() {
     local conf="$1" tun="$2"
-    grep -qE '^tun_name[[:space:]]*=' "$conf" 2>/dev/null && return 0
-    # 文件末尾追加（确保末尾有换行）
-    printf '\ntun_name = "%s"\n' "$tun" >> "$conf"
+    if grep -qE '^tun_name[[:space:]]*=' "$conf" 2>/dev/null; then
+        sed -i -E "s|^tun_name[[:space:]]*=.*|tun_name = \"${tun}\"|" "$conf"
+    else
+        # 确保末尾有换行
+        [ -n "$(tail -c1 "$conf" 2>/dev/null)" ] && printf '\n' >> "$conf"
+        printf 'tun_name = "%s"\n' "$tun" >> "$conf"
+    fi
 }
 
-# 启动前确保 config 中有 tun_name，缺则写入 ${IFACE_PREFIX}_${name}
+# 启动前强制把 config 里的 tun_name 对齐到 ${IFACE_PREFIX}_${name}
+# （旧版本可能写入 vnt_proxyXX，与 IFACE_PREFIX="vnt2" 不一致）
 ensure_tun_name() {
     local name="$1" type="$2"
     local conf="${CONFIG_PATH}/${name}.${type}"
     [ -f "$conf" ] || return 1
+    local desired="${IFACE_PREFIX}_${name}"
     local existing
     existing=$(get_tun_name "$name" "$type")
-    [ -n "$existing" ] && return 0
-    _append_tun_name "$conf" "${IFACE_PREFIX}_${name}"
+    if [ "$existing" = "$desired" ]; then
+        return 0
+    fi
+    _set_tun_name "$conf" "$desired"
+    _instance_log "${name}.${type}" "Fix tun_name: ${existing:-empty} -> ${desired}"
 }
 
 iface_sid() {
