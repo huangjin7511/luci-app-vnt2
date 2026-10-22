@@ -1,0 +1,182 @@
+#!/bin/sh
+# /etc/vnt/vnt-hotspot-manager
+# KWRT VNT 隧道监控 + Hostapd-CLI 热点隐藏控制器
+# 自动映射版：根据 SSID 命名规则自动生成热点-VNT 对应关系
+
+PROG=/etc/vnt/vnt-hotspot-manager
+PID_FILE=/var/run/vnt-hotspot-manager.pid
+LOG_FILE="/var/log/vnt-hotspot.log"
+STATE_DIR="/var/run/vnt-hotspot-state"
+
+# 检测间隔（秒）
+CHECK_INTERVAL=10
+# Ping 检测参数
+PING_COUNT=3
+PING_TIMEOUT=2
+
+# 自动映射参数
+BASE_IP=100          # 对端 IP 起始偏移量（10.26.0.100 + 编号）
+VNT_PREFIX="vnt_"    # VNT 接口名前缀
+SSID_PATTERN="proxy[0-9][0-9]"  # SSID 匹配模式
+
+log_message() {
+    local level="$1"
+    local msg="$2"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $msg" >> "$LOG_FILE"
+}
+
+# 获取无线配置节名 (如 wifinet2)
+get_wifi_section() {
+    local ssid="$1"
+    uci show wireless | grep "=wifi-iface" | while IFS='=' read -r section _; do
+        local cur_ssid=$(uci -q get "${section}.ssid")
+        if [ "$cur_ssid" = "$ssid" ]; then
+            echo "${section#wireless.}"
+            break
+        fi
+    done
+}
+
+# 通过 hostapd 运行时状态获取 BSS（最准确）
+get_bss_by_ssid() {
+    local target_ssid="$1"
+    local hostapd_dir="/var/run/hostapd"
+    [ -d "$hostapd_dir" ] || hostapd_dir=$(find /var/run -name "hostapd*" -type d | head -1)
+    [ -z "$hostapd_dir" ] || [ ! -d "$hostapd_dir" ] && return
+
+    for bss_socket in "$hostapd_dir"/*; do
+        [ -S "$bss_socket" ] || continue
+        local bss_name=$(basename "$bss_socket")
+        local current_ssid=$(hostapd_cli -s "$hostapd_dir" -i "$bss_name" get_config 2>/dev/null | grep "^ssid=" | cut -d'=' -f2)
+        if [ "$current_ssid" = "$target_ssid" ]; then
+            echo "$bss_name"
+            return
+        fi
+    done
+}
+
+# 检查 VNT 连通性
+check_vnt_connectivity() {
+    local vnt_dev="$1"
+    local peer_ip="$2"
+    ip link show "$vnt_dev" 2>/dev/null | grep -q "LOWER_UP" || return 1
+    ping -I "$vnt_dev" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$peer_ip" >/dev/null 2>&1
+}
+
+# 仅设置 ignore_broadcast_ssid，不触发桥口震荡
+set_hotspot_hidden() {
+    local ssid="$1"
+    local target_hidden="$2" # 1=隐藏 0=显示
+
+    local bss=$(get_bss_by_ssid "$ssid")
+    local section=$(get_wifi_section "$ssid")
+
+    if [ -z "$bss" ] || [ -z "$section" ]; then
+        return 1
+    fi
+
+    # 检查 UCI 基线
+    local current_hidden=$(uci -q get wireless.$section.hidden || echo "0")
+    if [ "$current_hidden" = "$target_hidden" ]; then
+        return 1 # 状态一致，无需操作
+    fi
+
+    # 关键操作：仅设置参数，不 disable/enable
+    hostapd_cli -i "$bss" set ignore_broadcast_ssid "$target_hidden" >/dev/null 2>&1
+    
+    log_message "INFO" "热点 $ssid ($bss) hidden=$target_hidden"
+    
+    # 同步 UCI 基线
+    uci set wireless.$section.hidden="$target_hidden"
+    uci commit wireless
+    return 0
+}
+
+# 自动生成映射：扫描所有 wifi-iface，提取符合规则的热点
+generate_mapping() {
+    uci show wireless | grep "=wifi-iface" | while IFS='=' read -r section _; do
+        local ssid=$(uci -q get "${section}.ssid")
+        [ -z "$ssid" ] && continue
+        
+        # 判断是否为目标热点
+        case "$ssid" in
+            proxy[0-9][0-9])
+                local num="${ssid#proxy}"           # 提取数字部分，如 "00"
+                local vnt_dev="${VNT_PREFIX}${ssid}" # vnt_proxy00
+                local peer_ip="10.26.0.$((10#$BASE_IP + 10#$num))"
+                echo "$ssid $vnt_dev $peer_ip"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+    done
+}
+
+cleanup() {
+    log_message "INFO" "收到终止信号，开始清理..."
+    generate_mapping | while read -r ssid vnt_dev peer_ip; do
+        [ -z "$ssid" ] && continue
+        set_hotspot_hidden "$ssid" "1"
+    done
+    rm -f "$PID_FILE"
+    log_message "INFO" "清理完成，退出"
+    exit 0
+}
+
+main_loop() {
+    log_message "INFO" "VNT 热点管理器启动 (PID: $$)"
+    trap cleanup SIGTERM SIGINT SIGQUIT
+
+    # 初始化状态目录
+    mkdir -p "$STATE_DIR"
+
+    # 基线校验：确保所有热点默认隐藏
+    log_message "INFO" "校验热点隐藏基线..."
+    local baseline_changed=0
+    generate_mapping | while read -r ssid vnt_dev peer_ip; do
+        [ -z "$ssid" ] && continue
+        local section=$(get_wifi_section "$ssid")
+        if [ -n "$section" ]; then
+            local current_hidden=$(uci -q get wireless.$section.hidden || echo "0")
+            if [ "$current_hidden" != "1" ]; then
+                log_message "WARN" "热点 $ssid 基线未隐藏，自动修正"
+                set_hotspot_hidden "$ssid" "1"
+                baseline_changed=1
+            fi
+        fi
+    done
+    
+    if [ "$baseline_changed" -eq 1 ]; then
+        log_message "INFO" "基线修正完成"
+    else
+        log_message "INFO" "所有热点基线已隐藏，无需修正"
+    fi
+
+    # 主循环
+    while true; do
+        generate_mapping | while read -r ssid vnt_dev peer_ip; do
+            [ -z "$ssid" ] && continue
+            if check_vnt_connectivity "$vnt_dev" "$peer_ip"; then
+                set_hotspot_hidden "$ssid" "0" # VNT 通 -> 显示
+            else
+                set_hotspot_hidden "$ssid" "1" # VNT 断 -> 隐藏
+            fi
+        done
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
+mkdir -p "$(dirname "$LOG_FILE")"
+echo $$ > "$PID_FILE"
+
+# 依赖检查
+for cmd in ping ip uci hostapd_cli; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        log_message "ERROR" "依赖命令 $cmd 不存在，退出"
+        rm -f "$PID_FILE"
+        exit 1
+    fi
+done
+
+main_loop
