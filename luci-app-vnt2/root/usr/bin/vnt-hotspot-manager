@@ -16,7 +16,7 @@ PING_TIMEOUT=2
 
 # 自动映射参数
 BASE_IP=100          # 对端 IP 起始偏移量（10.26.0.100 + 编号）
-VNT_PREFIX="vnt_"    # VNT 接口名前缀
+VNT_PREFIX="vnt2_"    # VNT 接口名前缀（与 IFACE_PREFIX 对齐）
 SSID_PATTERN="proxy[0-9][0-9]"  # SSID 匹配模式
 
 log_message() {

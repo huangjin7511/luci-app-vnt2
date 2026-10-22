@@ -34,7 +34,7 @@ log_message() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $msg" >> "$LOG_FILE"
 }
 
-# 动态构建映射表：proxyXX → vnt_proxyXX → 10.26.0.(100+XX)
+# 动态构建映射表：proxyXX → vnt2_proxyXX → 10.26.0.(100+XX)
 build_mapping() {
     uci show wireless | grep "=wifi-iface" | while IFS='=' read -r section _; do
         local cur_ssid
@@ -43,7 +43,7 @@ build_mapping() {
             proxy[0-9][0-9])
                 local idx="${cur_ssid#proxy}"
                 local num=$((10#$idx))
-                local vnt_dev="vnt_proxy${idx}"
+                local vnt_dev="vnt2_proxy${idx}"
                 local peer_ip="10.26.0.$((100+num))"
                 echo "${cur_ssid} ${vnt_dev} ${peer_ip}"
                 ;;

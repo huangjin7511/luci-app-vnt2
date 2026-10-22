@@ -132,6 +132,25 @@ get_tun_name() {
     [ -f "$conf" ] && read_field "$conf" "tun_name"
 }
 
+# 向 TOML 风格 config 文件里追加 tun_name 字段（已存在则不动）
+_append_tun_name() {
+    local conf="$1" tun="$2"
+    grep -qE '^tun_name[[:space:]]*=' "$conf" 2>/dev/null && return 0
+    # 文件末尾追加（确保末尾有换行）
+    printf '\ntun_name = "%s"\n' "$tun" >> "$conf"
+}
+
+# 启动前确保 config 中有 tun_name，缺则写入 ${IFACE_PREFIX}_${name}
+ensure_tun_name() {
+    local name="$1" type="$2"
+    local conf="${CONFIG_PATH}/${name}.${type}"
+    [ -f "$conf" ] || return 1
+    local existing
+    existing=$(get_tun_name "$name" "$type")
+    [ -n "$existing" ] && return 0
+    _append_tun_name "$conf" "${IFACE_PREFIX}_${name}"
+}
+
 iface_sid() {
     printf '%s_%s' "$IFACE_PREFIX" "$1" | tr -cd 'a-zA-Z0-9_' | cut -c1-15
 }
@@ -765,6 +784,10 @@ _do_start_instance() {
     if ! is_instance_running "$name" "$type"; then
         [ -n "$tun_name" ] && ip link delete "$tun_name" 2>/dev/null
     fi
+
+    # 写入 tun_name 到 config（若未设置），让二进制创建指定接口名
+    ensure_tun_name "$name" "$type"
+    tun_name=$(get_tun_name "$name" "$type")
 
     procd_open_instance "${name}.${type}"
     procd_set_param command "$VNT_RUN" "$name" "$log_file" "$type"
