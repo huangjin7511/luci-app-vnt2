@@ -4,9 +4,10 @@
 START=99
 STOP=10
 USE_PROCD=1
-EXTRA_COMMANDS="fw_reload_now fw_purge"
+EXTRA_COMMANDS="fw_reload_now fw_purge fix_routes"
 EXTRA_HELP="	fw_reload_now            Reload fw4 rules quietly, start firewall if not loaded
-	fw_purge                 Remove all vnt2 firewall rules synchronously"
+	fw_purge                 Remove all vnt2 firewall rules synchronously
+	fix_routes               Probe and fix LAN side routes for enabled vnt instances"
 
 BIN_PATH="/usr/bin"
 CONFIG_PATH="/etc/vnt2_config"
@@ -24,7 +25,7 @@ INITD="/etc/init.d"
 IFACE_PREFIX="vnt2"
 RESPAWN_THRESHOLD=3600
 RESPAWN_TIMEOUT=5
-RESPAWN_RETRY=5
+RESPAWN_RETRY=10000
 STARTUP_CHECK_WINDOW=60
 KILL_INTERVAL=1800
 WEB_TOKEN=""
@@ -32,6 +33,7 @@ WEB_ADDR="0.0.0.0:19099"
 WEB_ENABLED="1"
 WEB_DATA_DIR="/vnt_config"
 WEB_INSTANCE="vnt2_web"
+ROUTE_FIX_LOCK="${LOG_DIR}/vnt2_route_fixing"
 
 VNT_PORT_FIELDS="tcp_bind quic_bind ws_bind tunnel_port tunnel_addr"
 VNTS_PORT_FIELDS="tcp_bind quic_bind ws_bind server_quic_bind"
@@ -128,6 +130,98 @@ read_section_field() {
 get_tun_name() {
     local conf="${CONFIG_PATH}/${1}.${2}"
     [ -f "$conf" ] && read_field "$conf" "tun_name"
+}
+
+# 写入或更新 TOML 风格 config 文件中的 tun_name 字段
+_set_tun_name() {
+    local conf="$1" tun="$2"
+    if grep -qE '^tun_name[[:space:]]*=' "$conf" 2>/dev/null; then
+        sed -i -E "s|^tun_name[[:space:]]*=.*|tun_name = \"${tun}\"|" "$conf"
+    else
+        # 确保末尾有换行
+        [ -n "$(tail -c1 "$conf" 2>/dev/null)" ] && printf '\n' >> "$conf"
+        printf 'tun_name = "%s"\n' "$tun" >> "$conf"
+    fi
+}
+
+# 启动前强制把 config 里的 tun_name 对齐到 ${IFACE_PREFIX}_${name}
+# （旧版本可能写入 vnt_proxyXX，与 IFACE_PREFIX="vnt2" 不一致）
+ensure_tun_name() {
+    local name="$1" type="$2"
+    local conf="${CONFIG_PATH}/${name}.${type}"
+    [ -f "$conf" ] || return 1
+    local desired="${IFACE_PREFIX}_${name}"
+    local existing
+    existing=$(get_tun_name "$name" "$type")
+    if [ "$existing" = "$desired" ]; then
+        return 0
+    fi
+    _set_tun_name "$conf" "$desired"
+    _instance_log "${name}.${type}" "Fix tun_name: ${existing:-empty} -> ${desired}"
+}
+
+# 实例级 vnt.config 自动渲染
+# 驱动字段（UCI section 内）:
+#   auto_config=1       启用自动渲染
+#   network_code        虚拟 LAN 编号（留空自动用 name）
+#   server              跳板机地址数组（TOML 数组格式字符串），如 '["wss://host:port"]'
+#   local_ip            本机虚拟 IP（留空默认 10.26.0.{idx+10}）
+#   input_subnet        代理网段（留空默认 192.168.{idx}.0/24）
+#   remote_vip          跳板机在其 network_code 下的虚拟 IP（留空默认 10.26.0.{idx+100}）
+# 其中 idx 从 name 里的 proxyNN 后缀提取，若无则从 section 序号推断
+render_instance_config() {
+    local sid="$1" name="$2" type="$3"
+    [ "$type" != "vnt" ] && return 0
+
+    local conf="${CONFIG_PATH}/${name}.${type}"
+    local tmpl="${CONFIG_PATH}/vnt.config"
+    [ -f "$tmpl" ] || {
+        _instance_log "${name}.${type}" "config template ${tmpl} missing, skip render"
+        return 1
+    }
+
+    local auto_code server local_ip input_subnet remote_vip idx network_code
+    local input_entry
+
+    auto_code=$(uci -q get "vnt2.${sid}.auto_config" 2>/dev/null)
+    [ "$auto_code" != "1" ] && return 0
+
+    # 从 name 里提取 idx（proxy00 -> 0），失败则从 section 序号推断
+    idx=$(printf '%s' "$name" | grep -oE '[0-9]+' | tail -1)
+    if [ -z "$idx" ]; then
+        idx=$(printf '%s' "$sid" | grep -oE '[0-9]+' | tail -1)
+    fi
+    [ -z "$idx" ] && idx=0
+    idx=$((10#$idx))
+
+    network_code=$(uci -q get "vnt2.${sid}.network_code" 2>/dev/null)
+    [ -z "$network_code" ] && network_code="$name"
+
+    server=$(uci -q get "vnt2.${sid}.server" 2>/dev/null)
+    [ -z "$server" ] && server='[]'
+
+    local_ip=$(uci -q get "vnt2.${sid}.local_ip" 2>/dev/null)
+    [ -z "$local_ip" ] && local_ip="10.26.0.$((idx + 10))"
+
+    input_subnet=$(uci -q get "vnt2.${sid}.input_subnet" 2>/dev/null)
+    [ -z "$input_subnet" ] && input_subnet="192.168.${idx}.0/24"
+
+    remote_vip=$(uci -q get "vnt2.${sid}.remote_vip" 2>/dev/null)
+    [ -z "$remote_vip" ] && remote_vip="10.26.0.$((idx + 100))"
+
+    # 渲染目标 config（覆盖写，auto_config=1 视为模板托管）
+    cp -f "$tmpl" "$conf" || return 1
+
+    sed -i -E "s|^network_code[[:space:]]*=.*|network_code = \"${network_code}\"|" "$conf"
+    sed -i -E "s|^server[[:space:]]*=.*|server = ${server}|" "$conf"
+    sed -i -E "s|^ip[[:space:]]*=.*|ip = \"${local_ip}\"|" "$conf"
+    # input 只替换单行数组整值，复杂多条手动配置请关闭 auto_config
+    input_entry="\"${input_subnet},${remote_vip}\""
+    sed -i -E "s|^input[[:space:]]*=.*|input = [${input_entry}]|" "$conf"
+
+    # tun_name 由 ensure_tun_name 单独处理
+    _instance_log "${name}.${type}" "Rendered config: network=${network_code} server=${server} ip=${local_ip} input=${input_subnet},${remote_vip}"
+    return 0
 }
 
 iface_sid() {
@@ -328,7 +422,9 @@ _remove_all_vnt2_ifaces() {
 
 rebuild_network_interfaces() {
     _remove_all_vnt2_ifaces
-    each_enabled_vnts _create_iface
+    # 对 vnt 客户端 + vnts 服务端全部注册进 network uci，
+    # 让 pbr/LuCI 能扫描到这些 interface
+    each_enabled_instance _create_iface
     uci commit network
     "$INITD/network" reload 2>/dev/null
 }
@@ -642,6 +738,80 @@ get_bin_args() {
     cmd=$(render_template "$tpl" "$bin" "$conf" "$name" "$type")
     cmdline_to_pipes "$cmd"
 }
+_try_fix_cidr() {
+    local lan_cidr="$1"
+    local name sid key conf tun_name lan_gw tmp enabled prev_rt
+    lan_gw=$(printf '%s' "$lan_cidr" | cut -d'/' -f1 | sed 's/\.[0-9]*$/.1/')
+    tmp=$(make_tmp)
+    uci -q show vnt2 | grep -E "^vnt2\.[^.]*=vnt$" > "$tmp"
+    while IFS='=' read -r key _; do
+        sid=$(printf '%s' "$key" | cut -d. -f2)
+        name=$(uci -q get "vnt2.${sid}.name")
+        enabled=$(uci -q get "vnt2.${sid}.enabled")
+        [ -z "$name" ] || [ "$enabled" != "1" ] && continue
+        conf="${CONFIG_PATH}/${name}.vnt"
+        [ -f "$conf" ] || continue
+        grep -qF "$lan_cidr" "$conf" 2>/dev/null || continue
+        tun_name=$(get_tun_name "$name" "vnt")
+        [ -z "$tun_name" ] && continue
+
+        # 记录之前的路由（用于失败回滚）
+        prev_rt=$(ip route show "$lan_cidr" 2>/dev/null)
+
+        if ip route replace "$lan_cidr" dev "$tun_name" 2>/dev/null; then
+            _instance_log "$name" "Fix route: ${lan_cidr} dev ${tun_name}"
+            if ping -c1 -W2 "$lan_gw" > /dev/null 2>&1; then
+                echo "$lan_cidr" >> "$_FIXED_CIDRS"
+                rm -f "$tmp"
+                return 0
+            fi
+            _instance_log "$name" "Route switched but still unreachable, rollback..."
+            # 回滚：恢复之前的路由，若无则删除
+            ip route del "$lan_cidr" dev "$tun_name" 2>/dev/null
+            if [ -n "$prev_rt" ]; then
+                printf '%s\n' "$prev_rt" | while read -r r; do ip route add $r 2>/dev/null; done
+            fi
+        fi
+        _instance_log "$name" "try next instance for ${lan_cidr}..."
+    done < "$tmp"
+    rm -f "$tmp"
+    return 1
+}
+
+_collect_cidrs() {
+    local name="$1" type="$2"
+    [ "$type" = "vnts" ] && return
+    local conf="${CONFIG_PATH}/${name}.${type}"
+    local entry lan_cidr
+    grep -qE "^input[[:space:]]*=" "$conf" 2>/dev/null || return
+    for entry in $(grep -E "^input[[:space:]]*=" "$conf" 2>/dev/null \
+        | grep -oE '"[^"]+"' | tr -d '"'); do
+        lan_cidr=$(printf '%s' "$entry" | cut -d',' -f1)
+        [ -z "$lan_cidr" ] && continue
+        printf '%s' "$lan_cidr" \
+            | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' || continue
+        grep -qF "$lan_cidr" "$_ALL_CIDRS" 2>/dev/null && continue
+        echo "$lan_cidr" >> "$_ALL_CIDRS"
+    done
+}
+
+fix_all_routes() {
+    _ALL_CIDRS=$(make_tmp)
+    _FIXED_CIDRS=$(make_tmp)
+    each_enabled_instance _collect_cidrs
+    while read -r cidr; do
+        grep -qF "$cidr" "$_FIXED_CIDRS" 2>/dev/null && continue
+        _try_fix_cidr "$cidr"
+    done < "$_ALL_CIDRS"
+    rm -f "$_ALL_CIDRS" "$_FIXED_CIDRS"
+    rmdir "$ROUTE_FIX_LOCK" 2>/dev/null
+}
+
+fix_routes() {
+    init_paths
+    fix_all_routes
+}
+
 _cleanup_tun() {
     local name="$1" type="$2" tun_name="$3"
     [ -n "$tun_name" ] && ip link delete "$tun_name" 2>/dev/null
@@ -682,6 +852,17 @@ _do_start_instance() {
     local name="$1" type="$2" tun_name="$3"
     local conf="${CONFIG_PATH}/${name}.${type}"
     local bin_args bin log_file
+
+    # 自动渲染实例级 config（若启用 auto_config=1）
+    local sid
+    sid=$(uci -q show vnt2 2>/dev/null \
+        | grep -E "^vnt2\.[^.]*=${type}$" \
+        | while IFS='=' read -r key _; do
+            local s="${key#vnt2.}"
+            if [ "$(uci -q get "vnt2.${s}.name")" = "$name" ]; then echo "$s"; return; fi
+          done)
+    [ -n "$sid" ] && render_instance_config "$sid" "$name" "$type"
+
     log_file="${LOG_DIR}/${name}.${type}.log"
 
     [ ! -f "$conf" ] && {
@@ -701,6 +882,10 @@ _do_start_instance() {
     if ! is_instance_running "$name" "$type"; then
         [ -n "$tun_name" ] && ip link delete "$tun_name" 2>/dev/null
     fi
+
+    # 写入 tun_name 到 config（若未设置），让二进制创建指定接口名
+    ensure_tun_name "$name" "$type"
+    tun_name=$(get_tun_name "$name" "$type")
 
     procd_open_instance "${name}.${type}"
     procd_set_param command "$VNT_RUN" "$name" "$log_file" "$type"
@@ -737,6 +922,7 @@ start_service() {
     esac
     init_paths
     setup_cron
+    procd_set_param limits nofile="65535 65535"
     local b need_vnt="" need_vnts="" projects=""
     for b in $(_install_selection); do
         case "$b" in
@@ -763,14 +949,16 @@ start_service() {
     fi
     each_enabled_instance _do_start_instance
     rebuild_network_interfaces
-    : > "$FW_ACTIVE"
-    fw_worker_request
+    # 防火墙由用户自行管理（pbr 等），不启用 vnt2 自动防火墙
+    # : > "$FW_ACTIVE"
+    # fw_worker_request
+    fix_all_routes
 }
 
 stop_service() {
     rm -f "$FW_ACTIVE"
     each_enabled_instance _cleanup_tun
     cleanup_network_interfaces
-    fw_worker_request
+    # fw_worker_request
 }
 
