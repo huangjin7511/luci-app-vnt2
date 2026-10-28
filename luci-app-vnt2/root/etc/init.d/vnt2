@@ -160,6 +160,70 @@ ensure_tun_name() {
     _instance_log "${name}.${type}" "Fix tun_name: ${existing:-empty} -> ${desired}"
 }
 
+# 实例级 vnt.config 自动渲染
+# 驱动字段（UCI section 内）:
+#   auto_config=1       启用自动渲染
+#   network_code        虚拟 LAN 编号（留空自动用 name）
+#   server              跳板机地址数组（TOML 数组格式字符串），如 '["wss://host:port"]'
+#   local_ip            本机虚拟 IP（留空默认 10.26.0.{idx+10}）
+#   input_subnet        代理网段（留空默认 192.168.{idx}.0/24）
+#   remote_vip          跳板机在其 network_code 下的虚拟 IP（留空默认 10.26.0.{idx+100}）
+# 其中 idx 从 name 里的 proxyNN 后缀提取，若无则从 section 序号推断
+render_instance_config() {
+    local sid="$1" name="$2" type="$3"
+    [ "$type" != "vnt" ] && return 0
+
+    local conf="${CONFIG_PATH}/${name}.${type}"
+    local tmpl="${CONFIG_PATH}/vnt.config"
+    [ -f "$tmpl" ] || {
+        _instance_log "${name}.${type}" "config template ${tmpl} missing, skip render"
+        return 1
+    }
+
+    local auto_code server local_ip input_subnet remote_vip idx network_code
+    local input_entry
+
+    auto_code=$(uci -q get "vnt2.${sid}.auto_config" 2>/dev/null)
+    [ "$auto_code" != "1" ] && return 0
+
+    # 从 name 里提取 idx（proxy00 -> 0），失败则从 section 序号推断
+    idx=$(printf '%s' "$name" | grep -oE '[0-9]+' | tail -1)
+    if [ -z "$idx" ]; then
+        idx=$(printf '%s' "$sid" | grep -oE '[0-9]+' | tail -1)
+    fi
+    [ -z "$idx" ] && idx=0
+    idx=$((10#$idx))
+
+    network_code=$(uci -q get "vnt2.${sid}.network_code" 2>/dev/null)
+    [ -z "$network_code" ] && network_code="$name"
+
+    server=$(uci -q get "vnt2.${sid}.server" 2>/dev/null)
+    [ -z "$server" ] && server='[]'
+
+    local_ip=$(uci -q get "vnt2.${sid}.local_ip" 2>/dev/null)
+    [ -z "$local_ip" ] && local_ip="10.26.0.$((idx + 10))"
+
+    input_subnet=$(uci -q get "vnt2.${sid}.input_subnet" 2>/dev/null)
+    [ -z "$input_subnet" ] && input_subnet="192.168.${idx}.0/24"
+
+    remote_vip=$(uci -q get "vnt2.${sid}.remote_vip" 2>/dev/null)
+    [ -z "$remote_vip" ] && remote_vip="10.26.0.$((idx + 100))"
+
+    # 渲染目标 config（覆盖写，auto_config=1 视为模板托管）
+    cp -f "$tmpl" "$conf" || return 1
+
+    sed -i -E "s|^network_code[[:space:]]*=.*|network_code = \"${network_code}\"|" "$conf"
+    sed -i -E "s|^server[[:space:]]*=.*|server = ${server}|" "$conf"
+    sed -i -E "s|^ip[[:space:]]*=.*|ip = \"${local_ip}\"|" "$conf"
+    # input 只替换单行数组整值，复杂多条手动配置请关闭 auto_config
+    input_entry="\"${input_subnet},${remote_vip}\""
+    sed -i -E "s|^input[[:space:]]*=.*|input = [${input_entry}]|" "$conf"
+
+    # tun_name 由 ensure_tun_name 单独处理
+    _instance_log "${name}.${type}" "Rendered config: network=${network_code} server=${server} ip=${local_ip} input=${input_subnet},${remote_vip}"
+    return 0
+}
+
 iface_sid() {
     printf '%s_%s' "$IFACE_PREFIX" "$1" | tr -cd 'a-zA-Z0-9_' | cut -c1-15
 }
@@ -676,7 +740,7 @@ get_bin_args() {
 }
 _try_fix_cidr() {
     local lan_cidr="$1"
-    local name sid key conf tun_name lan_gw tmp enabled
+    local name sid key conf tun_name lan_gw tmp enabled prev_rt
     lan_gw=$(printf '%s' "$lan_cidr" | cut -d'/' -f1 | sed 's/\.[0-9]*$/.1/')
     tmp=$(make_tmp)
     uci -q show vnt2 | grep -E "^vnt2\.[^.]*=vnt$" > "$tmp"
@@ -690,16 +754,28 @@ _try_fix_cidr() {
         grep -qF "$lan_cidr" "$conf" 2>/dev/null || continue
         tun_name=$(get_tun_name "$name" "vnt")
         [ -z "$tun_name" ] && continue
-        # ip route replace "$lan_cidr" dev "$tun_name" 2>/dev/null || continue
-        _instance_log "$name" "Fix route: ${lan_cidr} dev ${tun_name}"
-        ping -c1 -W2 "$lan_gw" > /dev/null 2>&1 && {
-            echo "$lan_cidr" >> "$_FIXED_CIDRS"
-            rm -f "$tmp"
-            return
-        }
-        _instance_log "$name" "Route switched but still unreachable, try next..."
+
+        # 记录之前的路由（用于失败回滚）
+        prev_rt=$(ip route show "$lan_cidr" 2>/dev/null)
+
+        if ip route replace "$lan_cidr" dev "$tun_name" 2>/dev/null; then
+            _instance_log "$name" "Fix route: ${lan_cidr} dev ${tun_name}"
+            if ping -c1 -W2 "$lan_gw" > /dev/null 2>&1; then
+                echo "$lan_cidr" >> "$_FIXED_CIDRS"
+                rm -f "$tmp"
+                return 0
+            fi
+            _instance_log "$name" "Route switched but still unreachable, rollback..."
+            # 回滚：恢复之前的路由，若无则删除
+            ip route del "$lan_cidr" dev "$tun_name" 2>/dev/null
+            if [ -n "$prev_rt" ]; then
+                printf '%s\n' "$prev_rt" | while read -r r; do ip route add $r 2>/dev/null; done
+            fi
+        fi
+        _instance_log "$name" "try next instance for ${lan_cidr}..."
     done < "$tmp"
     rm -f "$tmp"
+    return 1
 }
 
 _collect_cidrs() {
@@ -776,6 +852,17 @@ _do_start_instance() {
     local name="$1" type="$2" tun_name="$3"
     local conf="${CONFIG_PATH}/${name}.${type}"
     local bin_args bin log_file
+
+    # 自动渲染实例级 config（若启用 auto_config=1）
+    local sid
+    sid=$(uci -q show vnt2 2>/dev/null \
+        | grep -E "^vnt2\.[^.]*=${type}$" \
+        | while IFS='=' read -r key _; do
+            local s="${key#vnt2.}"
+            if [ "$(uci -q get "vnt2.${s}.name")" = "$name" ]; then echo "$s"; return; fi
+          done)
+    [ -n "$sid" ] && render_instance_config "$sid" "$name" "$type"
+
     log_file="${LOG_DIR}/${name}.${type}.log"
 
     [ ! -f "$conf" ] && {
